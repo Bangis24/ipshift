@@ -1,16 +1,21 @@
-;; Virtual IP Rights Exchange - Stage 2
-;; Adds marketplace functionality for intellectual property trading
+;; Virtual IP Rights Exchange - A decentralized platform for intellectual property trading
+;; Enables creators to mint and trade their digital intellectual property with robust royalty tracking
 
 ;; System error definitions
 (define-constant ACCESS-DENIED-CODE (err u201))
 (define-constant ALREADY-CLAIMED-CODE (err u202))
 (define-constant FUNDS-DEFICIENT-CODE (err u203))
 (define-constant ITEM-NOT-FOUND-CODE (err u204))
+(define-constant TRANSFER-PENDING-CODE (err u205))
 (define-constant CONTENT-SIZE-LIMIT-CODE (err u206))
+(define-constant COMMISSION-BOUNDS-CODE (err u207))
+(define-constant VALIDITY-DURATION-CODE (err u208))
 (define-constant INVALID-ITEM-REFERENCE-CODE (err u209))
+(define-constant GRADE-BOUNDS-CODE (err u210))
+(define-constant WITHDRAWN-STATUS-CODE (err u211))
+(define-constant QUANTUM-TOO-SMALL-CODE (err u212))
 (define-constant STORAGE-PATH-EMPTY-CODE (err u213))
 (define-constant METADATA-EMPTY-CODE (err u214))
-(define-constant QUANTUM-TOO-SMALL-CODE (err u212))
 (define-constant SYSTEM-MAX-VALUE u2000000000)
 
 ;; Core data structures
@@ -20,6 +25,10 @@
     originator: principal,
     current-rights-holder: (optional principal),
     data-volume: uint,
+    creator-commission: uint,
+    rights-duration: uint,
+    premium-classification: uint,
+    acquisition-timestamp: (optional uint),
     cdn-path: (string-ascii 30),
     content-summary: (string-ascii 20),
     market-status: (string-ascii 20)
@@ -36,11 +45,16 @@
 )
 
 ;; Core business logic implementations
-(define-public (mint-virtual-asset (data-volume uint) (cdn-path (string-ascii 30)) 
+(define-public (mint-virtual-asset (data-volume uint) (creator-commission uint) (rights-duration uint) 
+                             (premium-classification uint) (cdn-path (string-ascii 30)) 
                              (content-summary (string-ascii 20)))
   (let ((item-handle (+ (var-get registry-sequence) u1)))
     ;; Input validation suite
     (asserts! (> data-volume u0) CONTENT-SIZE-LIMIT-CODE)
+    (asserts! (<= creator-commission u50) COMMISSION-BOUNDS-CODE)
+    (asserts! (and (> rights-duration u0) (<= rights-duration u10000)) VALIDITY-DURATION-CODE)
+    (asserts! (and (>= premium-classification u1) (<= premium-classification u5)) GRADE-BOUNDS-CODE)
+    ;; Path and metadata validation
     (asserts! (> (len cdn-path) u0) STORAGE-PATH-EMPTY-CODE)
     (asserts! (> (len content-summary) u0) METADATA-EMPTY-CODE)
     
@@ -51,6 +65,10 @@
         originator: tx-sender,
         current-rights-holder: none,
         data-volume: data-volume,
+        creator-commission: creator-commission,
+        rights-duration: rights-duration,
+        premium-classification: premium-classification,
+        acquisition-timestamp: none,
         cdn-path: cdn-path,
         content-summary: content-summary,
         market-status: "LISTED"
@@ -87,6 +105,7 @@
     (map-set intellectual-property-vault { item-handle: item-handle }
       (merge asset-details { 
         current-rights-holder: (some tx-sender),
+        acquisition-timestamp: (some block-height),
         market-status: "RIGHTS_TRANSFERRED"
       })
     )
@@ -95,6 +114,34 @@
     (map-set wallet-ledger tx-sender (- acquirer-funds (get data-volume asset-details)))
     (map-set wallet-ledger (get originator asset-details) 
       (+ (default-to u0 (map-get? wallet-ledger (get originator asset-details))) (get data-volume asset-details)))
+    
+    (ok true)
+  )
+)
+
+(define-public (finalize-acquisition (item-handle uint))
+  (let (
+    (asset-details (unwrap! (map-get? intellectual-property-vault { item-handle: item-handle }) ITEM-NOT-FOUND-CODE))
+    (rights-holder-balance (default-to u0 (map-get? wallet-ledger tx-sender)))
+    (initial-payment (get data-volume asset-details))
+    (royalty-component (/ (* (get data-volume asset-details) (get creator-commission asset-details)) u100))
+    (premium-surcharge (/ (* initial-payment (get premium-classification asset-details)) u100))
+    (aggregate-cost (+ initial-payment royalty-component premium-surcharge))
+  )
+    ;; Comprehensive validation checks
+    (asserts! (<= item-handle (var-get registry-sequence)) INVALID-ITEM-REFERENCE-CODE)
+    (asserts! (is-eq (get current-rights-holder asset-details) (some tx-sender)) ACCESS-DENIED-CODE)
+    (asserts! (is-eq (get market-status asset-details) "RIGHTS_TRANSFERRED") ITEM-NOT-FOUND-CODE)
+    (asserts! (>= (- block-height (unwrap! (get acquisition-timestamp asset-details) ITEM-NOT-FOUND-CODE)) 
+                (get rights-duration asset-details)) TRANSFER-PENDING-CODE)
+    (asserts! (>= rights-holder-balance aggregate-cost) FUNDS-DEFICIENT-CODE)
+    
+    ;; Execute royalty payment
+    (map-set wallet-ledger tx-sender (- rights-holder-balance aggregate-cost))
+    (map-set wallet-ledger (get originator asset-details) 
+      (+ (default-to u0 (map-get? wallet-ledger (get originator asset-details))) 
+         aggregate-cost)
+    )
     
     ;; Update creator's reputation score
     (let ((merit-score (default-to u0 (map-get? creator-merit-index 
@@ -105,6 +152,9 @@
       )
     )
     
+    ;; Update asset lifecycle status
+    (map-set intellectual-property-vault { item-handle: item-handle } 
+      (merge asset-details { market-status: "ACQUISITION_COMPLETE" }))
     (ok true)
   )
 )
@@ -155,6 +205,13 @@
 
 (define-read-only (list-owned-assets (entity principal))
   (default-to (list) (map-get? client-acquisition-ledger entity))
+)
+
+;; Premium tier calculation
+(define-read-only (compute-premium-factor (premium-classification uint))
+  (if (and (>= premium-classification u1) (<= premium-classification u5))
+      (* premium-classification u1)
+      u0)  ;; Failsafe default for invalid parameters
 )
 
 ;; System initialization
